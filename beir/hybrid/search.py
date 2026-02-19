@@ -2,7 +2,7 @@
 import logging
 import textwrap
 import random
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from opensearchpy import OpenSearch, RequestsHttpConnection
 
 logger = logging.getLogger(__name__)
@@ -13,7 +13,11 @@ class RetrievalOpenSearch:
 
     def __init__(self, endpoint: str, port: str, index_name: str, model_id: str, batch_size: int = 128,
                  corpus_chunk_size: int = 50000, timeout: int = 30, search_method: str = 'bm25',
-                 pipeline_name: str = 'norm-pipeline', **kwargs):
+                 pipeline_name: str = 'norm-pipeline', 
+                 http_auth=None,           # Added
+                 use_ssl: bool = True,      # Added
+                 verify_certs: bool = True, # Added
+                 **kwargs):
         # model is class that provides encode_corpus() and encode_queries()
         self.took_time = {}
         self.batch_size = batch_size
@@ -27,18 +31,46 @@ class RetrievalOpenSearch:
         self.model_id = model_id
         self.search_method = search_method
         self.max_tokens = 512
+        self.pipeline_name = pipeline_name
+
+        print(f"[DEBUG] Initializing OpenSearch client...")
+        print(f"[DEBUG] Endpoint: {endpoint}:{port}")
+        print(f"[DEBUG] Index: {index_name}")
+        print(f"[DEBUG] Search Method: {search_method}")
+        print(f"[DEBUG] Auth type: {type(http_auth)}")
 
         self.opensearch = OpenSearch(
             hosts=[{
                 'host': endpoint,
                 'port': port
             }],
-            use_ssl=False,
-            verify_certs=False,
+            http_auth=http_auth,        # Added
+            use_ssl=use_ssl,            # Added
+            verify_certs=verify_certs,  # Added
             connection_class=RequestsHttpConnection,
             timeout=timeout
         )
-        self.pipeline_name = pipeline_name
+
+        # Test connection
+        self._test_connection()
+
+    def _test_connection(self):
+        """Test the OpenSearch connection"""
+        try:
+            info = self.opensearch.info()
+            print(f"[DEBUG] Connected to OpenSearch version: {info['version']['number']}")
+            
+            # Check if index exists
+            if self.opensearch.indices.exists(index=self.index_name):
+                print(f"[DEBUG] Index '{self.index_name}' exists")
+                count = self.opensearch.count(index=self.index_name)
+                print(f"[DEBUG] Document count: {count['count']}")
+            else:
+                print(f"[ERROR] Index '{self.index_name}' does NOT exist!")
+                
+        except Exception as e:
+            print(f"[ERROR] Failed to connect to OpenSearch: {e}")
+            raise
 
     """
         Function does bm25 search only
@@ -59,11 +91,6 @@ class RetrievalOpenSearch:
                         'fields': ['text_key', 'title_key'],
                         "tie_breaker": 0.5
                     }
-                    # 'match': {
-                    #     'text_key': {
-                    #         'query': query_text
-                    #     }
-                    # }
                 }
             }
 
@@ -120,103 +147,6 @@ class RetrievalOpenSearch:
 
         return self.results
 
-    # def search_bm25(self,
-    #                 corpus: Dict[str, Dict[str, str]],
-    #                 queries: Dict[str, str],
-    #                 top_k: int,
-    #                 return_sorted: bool = False, **kwargs) -> Dict[str, Dict[str, float]]:
-    #     # def get_body(k, query_text, model_id):
-    #     #     return {
-    #     #         'size': top_k,
-    #     #         'query': {
-    #     #             'neural': {
-    #     #                 'passage_embedding': {
-    #     #                     'query_text': query_text,
-    #     #                     'model_id': model_id,
-    #     #                     'k': k
-    #     #                 }
-    #     #             }
-    #     #         }
-    #     #     }
-    #
-    #     def get_body_bm25(k, query_text):
-    #         return {
-    #             'size': top_k,
-    #             'query': {
-    #                 # 'multi_match': {
-    #                 #     'query': query_text,
-    #                 #     'type': 'best_fields',
-    #                 #     'fields': ['text_key', 'title_key'],
-    #                 #     "tie_breaker": 0.5
-    #                 # }
-    #                 'match': {
-    #                     'text_key': {
-    #                         'query': query_text
-    #                     }
-    #                 }
-    #             }
-    #         }
-    #
-    #     def get_body(k, query_text):
-    #         searches = {
-    #             'bm25': get_body_bm25
-    #         }
-    #         return searches[self.search_method](k, query_text)
-    #
-    #     # def get_body(k, query_text, model_id):
-    #     #     return {
-    #     #         'size': top_k,
-    #     #         'query': {
-    #     #             "hybrid": {
-    #     #                 "queries": [
-    #     #                     {
-    #     #                         'neural': {
-    #     #                             'passage_embedding': {
-    #     #                                 'query_text': query_text,
-    #     #                                 'model_id': model_id,
-    #     #                                 'k': k
-    #     #                             }
-    #     #                         }
-    #     #                     },
-    #     #                     {
-    #     #                         'term': {
-    #     #                              'passage_text': query_text
-    #     #                         }
-    #     #                     }
-    #     #                 ]
-    #     #             }
-    #     #         }
-    #     #     }
-    #     # Create embeddings for all queries using model.encode_queries()
-    #     # Runs semantic search against the corpus embeddings
-    #     # Returns a ranked list with the corpus ids
-    #     # if score_function not in self.score_functions:
-    #     #    raise ValueError(
-    #     #        "score function: {} must be either (cos_sim) for cosine similarity or (dot) for dot product".format(
-    #     #            score_function))
-    #
-    #     logger.info("Encoding Queries...")
-    #     query_ids = list(queries.keys())
-    #     self.results = {qid: {} for qid in query_ids}
-    #     queries = [queries[qid] for qid in queries]
-    #     # query_embeddings = self.model.encode_queries(
-    #     #    queries, batch_size=self.batch_size, show_progress_bar=self.show_progress_bar,
-    #     #    convert_to_tensor=self.convert_to_tensor)
-    #
-    #     logger.info("Sorting Corpus by document length (Longest first)...")
-    #
-    #     corpus_ids = sorted(corpus, key=lambda k: len(corpus[k].get("title", "") + corpus[k].get("text", "")),
-    #                         reverse=True)
-    #     corpus = [corpus[cid] for cid in corpus_ids]
-    #
-    #     logger.info("Encoding Corpus in batches... Warning: This might take a while!")
-    #     # logger.info("Scoring Function: {} ({})".format(self.score_function_desc[score_function], score_function))
-    #
-    #     model_id = self.model_id
-    #     index_name = self.index_name
-    #
-    #     query_responses = []
-
     """
         Function works with vector based searches, knn/neural and hybrid
     """
@@ -226,19 +156,7 @@ class RetrievalOpenSearch:
                       top_k: int,
                       result_size: int,
                       return_sorted: bool = False, **kwargs) -> Dict[str, Dict[str, float]]:
-        # def get_body(k, query_text, model_id):
-        #     return {
-        #         'size': top_k,
-        #         'query': {
-        #             'neural': {
-        #                 'passage_embedding': {
-        #                     'query_text': query_text,
-        #                     'model_id': model_id,
-        #                     'k': k
-        #                 }
-        #             }
-        #         }
-        #     }
+
         def get_body_hybrid(query_text):
             return {
                 'size': result_size,
@@ -300,6 +218,7 @@ class RetrievalOpenSearch:
                     }
                 }
             }
+
         def get_body_neural(query_text):
             return {
                 'size': result_size,
@@ -335,7 +254,6 @@ class RetrievalOpenSearch:
         corpus = [corpus[cid] for cid in corpus_ids]
 
         logger.info("Encoding Corpus in batches... Warning: This might take a while!")
-        # logger.info("Scoring Function: {} ({})".format(self.score_function_desc[score_function], score_function))
 
         model_id = self.model_id
         index_name = self.index_name

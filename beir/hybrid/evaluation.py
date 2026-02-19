@@ -23,14 +23,13 @@ class EvaluateRetrieval:
 
     @staticmethod
     def evaluate(qrels: Dict[str, Dict[str, int]],
-                 results: Dict[str, Dict[str, float]],
-                 k_values: List[int],
-                 ignore_identical_ids: bool = True) -> Tuple[
+                results: Dict[str, Dict[str, float]],
+                k_values: List[int],
+                ignore_identical_ids: bool = True) -> Tuple[
         Dict[str, float], Dict[str, float], Dict[str, float], Dict[str, float]]:
 
         if ignore_identical_ids:
-            logging.info(
-                'For evaluation, we ignore identical query and document ids (default), please explicitly set ``ignore_identical_ids=False`` to ignore this.')
+            print('For evaluation, we ignore identical query and document ids (default), please explicitly set ``ignore_identical_ids=False`` to ignore this.')
             popped = []
             for qid, rels in results.items():
                 for pid in list(rels):
@@ -69,10 +68,11 @@ class EvaluateRetrieval:
             recall[f"Recall@{k}"] = round(recall[f"Recall@{k}"] / len(scores), 5)
             precision[f"P@{k}"] = round(precision[f"P@{k}"] / len(scores), 5)
 
-        for eval in [ndcg, _map, recall, precision]:
-            logging.info("\n")
-            for k in eval.keys():
-                logging.info("{}: {:.4f}".format(k, eval[k]))
+        # Changed from logging.info to print
+        for eval_dict, name in [(ndcg, "NDCG"), (_map, "MAP"), (recall, "Recall"), (precision, "Precision")]:
+            print(f"\n=== {name} ===")
+            for k, v in eval_dict.items():
+                print(f"{k}: {v:.4f}")
 
         return ndcg, _map, recall, precision
 

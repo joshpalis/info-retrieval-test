@@ -6,17 +6,39 @@ from opensearchpy import OpenSearch, RequestsHttpConnection
 
 class OpenSearchDataIngestor:
 
-    def __init__(self, endpoint: str, port: str, timeout: int = 30, language: str = "english"):
-        self.opensearch = OpenSearch(
-            hosts=[{
+    def __init__(self, endpoint: str, port: str, http_auth: Tuple[str, str] = None, timeout: int = 30, language: str = "english"):
+        """
+        Initialize OpenSearch data ingestor.
+        
+        Parameters
+        ----------
+        endpoint: str
+            OpenSearch host endpoint
+        port: str
+            OpenSearch port
+        http_auth: Tuple[str, str], optional
+            Tuple of (username, password) for HTTP basic authentication
+        timeout: int
+            Connection timeout in seconds
+        language: str
+            Language for text processing
+        """
+        client_config = {
+            'hosts': [{
                 'host': endpoint,
                 'port': port
             }],
-            use_ssl=False,
-            verify_certs=False,
-            connection_class=RequestsHttpConnection,
-            timeout=timeout
-        )
+            'use_ssl': True,
+            'verify_certs': True,
+            'connection_class': RequestsHttpConnection,
+            'timeout': timeout
+        }
+        
+        # Add authentication if provided
+        if http_auth is not None:
+            client_config['http_auth'] = http_auth
+        
+        self.opensearch = OpenSearch(**client_config)
         self.bulk_size = 200
         self.max_tokens = 512
         self.language = language
