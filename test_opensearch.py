@@ -4,7 +4,9 @@ from beir.hybrid.evaluation import EvaluateRetrieval
 from beir.hybrid.search import RetrievalOpenSearch
 from beir.agentic.search import RetrievalOpenSearchAgentic
 from beir.hybrid.data_ingestor import OpenSearchDataIngestor
+from bright_converter import convert_bright_task, BRIGHTConverter
 
+import gc
 import json
 import math
 import logging
@@ -69,16 +71,13 @@ def compute_per_query_ndcg(qrels, results, k_values):
         per_query_scores[qid] = {}
 
         for k in k_values:
-            # Get top-k results for this query sorted by score descending
             sorted_scores = sorted(results[qid].items(), key=lambda x: x[1], reverse=True)[:k]
 
-            # Compute DCG@k
             dcg = 0.0
             for i, (doc_id, _) in enumerate(sorted_scores):
                 rel = qrels[qid].get(doc_id, 0)
-                dcg += (2 ** rel - 1) / math.log2(i + 2)  # i+2 because position is 1-indexed
+                dcg += (2 ** rel - 1) / math.log2(i + 2)
 
-            # Compute IDCG@k (ideal ranking)
             ideal_rels = sorted(qrels[qid].values(), reverse=True)[:k]
             idcg = 0.0
             for i, rel in enumerate(ideal_rels):
@@ -98,11 +97,37 @@ def write_jsonl(file_path, records):
     print(f"Wrote {len(records)} records to {file_path}")
 
 
+def write_results_file(index_name, evaluation_results):
+    """
+    Write all evaluation results to a JSON file in the results directory.
+    File is named: {index_name}_{timestamp}.json
+    """
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    results_dir = os.path.join(pathlib.Path(__file__).parent.absolute(), "results")
+    os.makedirs(results_dir, exist_ok=True)
+
+    filename = f'{index_name}_{timestamp}.json'
+    filepath = os.path.join(results_dir, filename)
+
+    output = {
+        'index': index_name,
+        'timestamp': timestamp,
+        'evaluations': evaluation_results
+    }
+
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(output, f, indent=2)
+
+    print(f'\nResults file written: {filepath}')
+    return filepath
+
+
 def main(argv):
-    opts, args = getopt.getopt(argv, "d:u:h:p:i:m:n:o:l:e:a:w:r:s:q:",
+    opts, args = getopt.getopt(argv, "d:u:h:p:i:m:n:o:l:e:a:w:r:s:q:t:",
                                ["dataset=", "dataset_url=", "os_host=", "os_port=", "os_index=", "os_model_id=",
                                 "num_of_runs=", "operation=", "pipelines=", "method=", "username=", "password=",
-                                "region=", "sigv4", "service=", "queries_file="])
+                                "region=", "sigv4", "service=", "queries_file=",
+                                "bright_task=", "dataset_type=", "all_bright"])
     dataset = ''
     url = ''
     endpoint = ''
@@ -119,6 +144,9 @@ def main(argv):
     use_sigv4 = False
     service = 'es'
     queries_file = ''
+    bright_task = ''
+    dataset_type = 'beir'
+    all_bright = False
 
     for opt, arg in opts:
         if opt in ("-d", "--dataset"):
@@ -153,8 +181,16 @@ def main(argv):
             service = arg
         elif opt in ("-q", "--queries_file"):
             queries_file = arg
+        elif opt in ("-t", "--bright_task"):
+            bright_task = arg
+            dataset_type = 'bright'
+        elif opt in ("--dataset_type",):
+            dataset_type = arg
+        elif opt in ("--all_bright",):
+            all_bright = True
+            dataset_type = 'bright'
 
-    # Create auth based on authentication method
+    # Auth setup
     if use_sigv4:
         if not region:
             raise ValueError("Region is required for SigV4 authentication. Use --region flag.")
@@ -167,27 +203,94 @@ def main(argv):
         auth = None
         logging.info("No authentication configured")
 
-    #### Just some code to print debug information to stdout
     logging.basicConfig(format='%(asctime)s - %(message)s',
                         datefmt='%Y-%m-%d %H:%M:%S',
                         level=logging.INFO,
                         handlers=[LoggingHandler()])
 
-    #### Download dataset and unzip
-    # url = url.format(dataset)
-    # out_dir = os.path.join(pathlib.Path(__file__).parent.absolute(), "datasets")
-    # data_path = util.download_and_unzip(url, out_dir)
-    data_path = os.path.join(pathlib.Path(__file__).parent.absolute(), "datasets", dataset)
+    # ---- Determine which tasks to run ----
+    if all_bright:
+        tasks = BRIGHTConverter.AVAILABLE_TASKS
+        logging.info(f"Running all {len(tasks)} BRIGHT tasks: {tasks}")
+    elif dataset_type == 'bright':
+        if not bright_task:
+            raise ValueError(
+                f"BRIGHT task is required. Use --bright_task=<task_name> or --all_bright. "
+                f"Available tasks: {BRIGHTConverter.AVAILABLE_TASKS}"
+            )
+        tasks = [bright_task]
+    else:
+        tasks = []
 
-    #### Provide the data_path where dataset has been downloaded and unzipped
-    corpus, queries, qrels = GenericDataLoader(data_folder=data_path).load(split="test")
+    # ---- BRIGHT path: loop over tasks ----
+    if tasks:
+        out_dir = os.path.join(pathlib.Path(__file__).parent.absolute(), "datasets")
+        all_results = {}
 
-    if operation == 'ingest' or operation == 'both':
-        ingest_data(corpus, endpoint, index, port, auth)
+        for task in tasks:
+            task_index = index if index else f"bright-{task}"
+            logging.info("=" * 60)
+            logging.info(f"BRIGHT TASK: {task} | Index: {task_index}")
+            logging.info("=" * 60)
 
-    if operation == 'evaluate' or operation == 'both':
-        evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_runs, pipelines, mmethod,
-                 auth)
+            try:
+                # Convert BRIGHT HF data to BEIR format on disk
+                data_path = convert_bright_task(task, out_dir)
+                logging.info(f"BRIGHT data converted to BEIR format at: {data_path}")
+
+                # Load using existing GenericDataLoader
+                corpus, queries, qrels = GenericDataLoader(data_folder=data_path).load(split="test")
+
+                logging.info(f"Corpus size: {len(corpus)}")
+                logging.info(f"Number of queries: {len(queries)}")
+                logging.info(f"Qrel judgments: {sum(len(v) for v in qrels.values())} across {len(qrels)} queries")
+
+                if operation == 'ingest' or operation == 'both':
+                    ingest_data(corpus, endpoint, task_index, port, auth)
+                    logging.info(f"Ingestion complete for task: {task}")
+
+                if operation == 'evaluate' or operation == 'both':
+                    evaluate(corpus, endpoint, task_index, model_id, port, qrels, queries,
+                             num_of_runs, pipelines, mmethod, auth)
+
+                all_results[task] = {"status": "success", "corpus_size": len(corpus), "queries": len(queries)}
+
+            except Exception as e:
+                logging.error(f"Failed on task {task}: {e}")
+                all_results[task] = {"status": "failed", "error": str(e)}
+
+            finally:
+                # Free memory between tasks
+                gc.collect()
+
+        # Print summary
+        logging.info("=" * 60)
+        logging.info("ALL BRIGHT TASKS SUMMARY")
+        logging.info("=" * 60)
+        for task, result in all_results.items():
+            status = result["status"]
+            if status == "success":
+                logging.info(f"  ✓ {task:<25} corpus={result['corpus_size']:>8}  queries={result['queries']:>5}")
+            else:
+                logging.info(f"  ✗ {task:<25} ERROR: {result['error']}")
+
+    # ---- Original BEIR path ----
+    else:
+        url = url.format(dataset)
+        out_dir = os.path.join(pathlib.Path(__file__).parent.absolute(), "datasets")
+        data_path = util.download_and_unzip(url, out_dir)
+        corpus, queries, qrels = GenericDataLoader(data_folder=data_path).load(split="test")
+
+        logging.info(f"Corpus size: {len(corpus)}")
+        logging.info(f"Number of queries: {len(queries)}")
+        logging.info(f"Qrel judgments: {sum(len(v) for v in qrels.values())} across {len(qrels)} queries")
+
+        if operation == 'ingest' or operation == 'both':
+            ingest_data(corpus, endpoint, index, port, auth)
+
+        if operation == 'evaluate' or operation == 'both':
+            evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_runs, pipelines, mmethod,
+                     auth)
 
 
 def ingest_data(corpus, endpoint, index, port, auth=None):
@@ -204,8 +307,11 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_run
 
     mm = mmethod.split(',')
 
+    # Accumulate all evaluation results for the results file
+    all_evaluation_results = []
+
     # ──────────────────────────────────────────────
-    # evaluate_both – run agentic & bm25, compare per-query NDCG, output files
+    # evaluate_both – run agentic & bm25, compare per-query NDCG
     # ──────────────────────────────────────────────
     if 'evaluate_both' in mm:
         print('=' * 80)
@@ -250,11 +356,17 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_run
             qrels, bm25_results, k_values
         )
 
-        # ---------- Compute per-query NDCG ----------
+        # ---------- Compute per-query NDCG then FREE result dicts ----------
         agentic_per_query = compute_per_query_ndcg(qrels, agentic_results, k_values)
-        bm25_per_query = compute_per_query_ndcg(qrels, bm25_results, k_values)
+        del agentic_results
+        gc.collect()
+        print('[memory] freed agentic_results')
 
-        # Pick the primary k for sorting (NDCG@10 if available, else first k)
+        bm25_per_query = compute_per_query_ndcg(qrels, bm25_results, k_values)
+        del bm25_results
+        gc.collect()
+        print('[memory] freed bm25_results')
+
         primary_k = 10 if 10 in k_values else k_values[0]
         primary_key = f'NDCG@{primary_k}'
 
@@ -265,8 +377,8 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_run
         ties = 0
 
         for qid in queries:
-            agentic_scores = agentic_per_query.get(qid, {k_label: 0.0 for k_label in [f'NDCG@{k}' for k in k_values]})
-            bm25_scores = bm25_per_query.get(qid, {k_label: 0.0 for k_label in [f'NDCG@{k}' for k in k_values]})
+            agentic_scores = agentic_per_query.get(qid, {f'NDCG@{k}': 0.0 for k in k_values})
+            bm25_scores = bm25_per_query.get(qid, {f'NDCG@{k}': 0.0 for k in k_values})
 
             agentic_primary = agentic_scores.get(primary_key, 0.0)
             bm25_primary = bm25_scores.get(primary_key, 0.0)
@@ -281,17 +393,14 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_run
                 winner = 'tie'
                 ties += 1
 
-            record = {
+            comparison_records.append({
                 '_id': qid,
                 'text': queries[qid],
                 'agentic_scores': agentic_scores,
                 'bm25_scores': bm25_scores,
-                f'agentic_{primary_key}': agentic_primary,
-                f'bm25_{primary_key}': bm25_primary,
                 'winner': winner,
                 'score_diff': round(agentic_primary - bm25_primary, 5)
-            }
-            comparison_records.append(record)
+            })
 
         # ---------- Print aggregate summary ----------
         print('\n' + '=' * 80)
@@ -311,52 +420,31 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_run
         print(f'  BM25 wins    : {bm25_wins}/{len(comparison_records)}')
         print(f'  Ties         : {ties}/{len(comparison_records)}')
 
-        # ---------- Output files setup ----------
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_dir = os.path.join(pathlib.Path(__file__).parent.absolute(), "files")
-        os.makedirs(output_dir, exist_ok=True)
+        # ---------- Accumulate results ----------
+        all_evaluation_results.append({
+            'method': 'evaluate_both',
+            'agentic_aggregate': {
+                'ndcg': agentic_ndcg,
+                'map': agentic_map,
+                'recall': agentic_recall,
+                'precision': agentic_precision
+            },
+            'bm25_aggregate': {
+                'ndcg': bm25_ndcg,
+                'map': bm25_map,
+                'recall': bm25_recall,
+                'precision': bm25_precision
+            }
+        })
 
-        # ---------- Output File 1: queries ranked by agentic NDCG (descending) ----------
-        ranked_by_agentic = sorted(
-            comparison_records,
-            key=lambda x: x[f'agentic_{primary_key}'],
-            reverse=True
-        )
+        # Free per-query dicts
+        del agentic_per_query, bm25_per_query, comparison_records
+        gc.collect()
 
-        ranked_file = os.path.join(output_dir, f'agentic_ranked_queries_{timestamp}.jsonl')
-        ranked_output = []
-        for rank, record in enumerate(ranked_by_agentic, 1):
-            ranked_output.append({
-                'rank': rank,
-                '_id': record['_id'],
-                'text': record['text'],
-                f'agentic_{primary_key}': record[f'agentic_{primary_key}'],
-                f'bm25_{primary_key}': record[f'bm25_{primary_key}'],
-                'winner': record['winner'],
-            })
-        write_jsonl(ranked_file, ranked_output)
-
-        # ---------- Output File 2: full comparison with all scores ----------
-        comparison_file = os.path.join(output_dir, f'query_scores_comparison_{timestamp}.jsonl')
-        full_output = []
-        for record in comparison_records:
-            full_output.append({
-                '_id': record['_id'],
-                'text': record['text'],
-                'agentic_scores': record['agentic_scores'],
-                'bm25_scores': record['bm25_scores'],
-                'winner': record['winner'],
-                'score_diff_agentic_minus_bm25': record['score_diff'],
-            })
-        write_jsonl(comparison_file, full_output)
-
-        print(f'\nOutput files written:')
-        print(f'  Ranked by agentic : {ranked_file}')
-        print(f'  Full comparison   : {comparison_file}')
         print('--- end of results for evaluate_both ---')
 
     # ──────────────────────────────────────────────
-    # evaluate_both_neural – run agentic & neural, compare per-query NDCG, output files
+    # evaluate_both_neural – run agentic & neural, compare per-query NDCG
     # ──────────────────────────────────────────────
     if 'evaluate_both_neural' in mm:
         print('=' * 80)
@@ -403,11 +491,17 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_run
             qrels, neural_results, k_values
         )
 
-        # ---------- Compute per-query NDCG ----------
+        # ---------- Compute per-query NDCG then FREE result dicts ----------
         agentic_per_query = compute_per_query_ndcg(qrels, agentic_results, k_values)
-        neural_per_query = compute_per_query_ndcg(qrels, neural_results, k_values)
+        del agentic_results
+        gc.collect()
+        print('[memory] freed agentic_results')
 
-        # Pick the primary k for sorting (NDCG@10 if available, else first k)
+        neural_per_query = compute_per_query_ndcg(qrels, neural_results, k_values)
+        del neural_results
+        gc.collect()
+        print('[memory] freed neural_results')
+
         primary_k = 10 if 10 in k_values else k_values[0]
         primary_key = f'NDCG@{primary_k}'
 
@@ -418,8 +512,8 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_run
         ties = 0
 
         for qid in queries:
-            agentic_scores = agentic_per_query.get(qid, {k_label: 0.0 for k_label in [f'NDCG@{k}' for k in k_values]})
-            neural_scores = neural_per_query.get(qid, {k_label: 0.0 for k_label in [f'NDCG@{k}' for k in k_values]})
+            agentic_scores = agentic_per_query.get(qid, {f'NDCG@{k}': 0.0 for k in k_values})
+            neural_scores = neural_per_query.get(qid, {f'NDCG@{k}': 0.0 for k in k_values})
 
             agentic_primary = agentic_scores.get(primary_key, 0.0)
             neural_primary = neural_scores.get(primary_key, 0.0)
@@ -434,17 +528,14 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_run
                 winner = 'tie'
                 ties += 1
 
-            record = {
+            comparison_records.append({
                 '_id': qid,
                 'text': queries[qid],
                 'agentic_scores': agentic_scores,
                 'neural_scores': neural_scores,
-                f'agentic_{primary_key}': agentic_primary,
-                f'neural_{primary_key}': neural_primary,
                 'winner': winner,
                 'score_diff': round(agentic_primary - neural_primary, 5)
-            }
-            comparison_records.append(record)
+            })
 
         # ---------- Print aggregate summary ----------
         print('\n' + '=' * 80)
@@ -464,52 +555,31 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_run
         print(f'  Neural wins  : {neural_wins}/{len(comparison_records)}')
         print(f'  Ties         : {ties}/{len(comparison_records)}')
 
-        # ---------- Output files setup ----------
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_dir = os.path.join(pathlib.Path(__file__).parent.absolute(), "files")
-        os.makedirs(output_dir, exist_ok=True)
+        # ---------- Accumulate results ----------
+        all_evaluation_results.append({
+            'method': 'evaluate_both_neural',
+            'agentic_aggregate': {
+                'ndcg': agentic_ndcg,
+                'map': agentic_map,
+                'recall': agentic_recall,
+                'precision': agentic_precision
+            },
+            'neural_aggregate': {
+                'ndcg': neural_ndcg,
+                'map': neural_map,
+                'recall': neural_recall,
+                'precision': neural_precision
+            }
+        })
 
-        # ---------- Output File 1: queries ranked by agentic NDCG (descending) ----------
-        ranked_by_agentic = sorted(
-            comparison_records,
-            key=lambda x: x[f'agentic_{primary_key}'],
-            reverse=True
-        )
+        # Free per-query dicts
+        del agentic_per_query, neural_per_query, comparison_records
+        gc.collect()
 
-        ranked_file = os.path.join(output_dir, f'agentic_vs_neural_ranked_queries_{timestamp}.jsonl')
-        ranked_output = []
-        for rank, record in enumerate(ranked_by_agentic, 1):
-            ranked_output.append({
-                'rank': rank,
-                '_id': record['_id'],
-                'text': record['text'],
-                f'agentic_{primary_key}': record[f'agentic_{primary_key}'],
-                f'neural_{primary_key}': record[f'neural_{primary_key}'],
-                'winner': record['winner'],
-            })
-        write_jsonl(ranked_file, ranked_output)
-
-        # ---------- Output File 2: full comparison with all scores ----------
-        comparison_file = os.path.join(output_dir, f'agentic_vs_neural_scores_comparison_{timestamp}.jsonl')
-        full_output = []
-        for record in comparison_records:
-            full_output.append({
-                '_id': record['_id'],
-                'text': record['text'],
-                'agentic_scores': record['agentic_scores'],
-                'neural_scores': record['neural_scores'],
-                'winner': record['winner'],
-                'score_diff_agentic_minus_neural': record['score_diff'],
-            })
-        write_jsonl(comparison_file, full_output)
-
-        print(f'\nOutput files written:')
-        print(f'  Ranked by agentic : {ranked_file}')
-        print(f'  Full comparison   : {comparison_file}')
         print('--- end of results for evaluate_both_neural ---')
 
     # ──────────────────────────────────────────────
-    # NEW: evaluate_both_hybrid – run agentic & hybrid, compare per-query NDCG, output files
+    # evaluate_both_hybrid – run agentic & hybrid, compare per-query NDCG
     # ──────────────────────────────────────────────
     if 'evaluate_both_hybrid' in mm:
         print('=' * 80)
@@ -556,11 +626,17 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_run
             qrels, hybrid_results, k_values
         )
 
-        # ---------- Compute per-query NDCG ----------
+        # ---------- Compute per-query NDCG then FREE result dicts ----------
         agentic_per_query = compute_per_query_ndcg(qrels, agentic_results, k_values)
-        hybrid_per_query = compute_per_query_ndcg(qrels, hybrid_results, k_values)
+        del agentic_results
+        gc.collect()
+        print('[memory] freed agentic_results')
 
-        # Pick the primary k for sorting (NDCG@10 if available, else first k)
+        hybrid_per_query = compute_per_query_ndcg(qrels, hybrid_results, k_values)
+        del hybrid_results
+        gc.collect()
+        print('[memory] freed hybrid_results')
+
         primary_k = 10 if 10 in k_values else k_values[0]
         primary_key = f'NDCG@{primary_k}'
 
@@ -571,8 +647,8 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_run
         ties = 0
 
         for qid in queries:
-            agentic_scores = agentic_per_query.get(qid, {k_label: 0.0 for k_label in [f'NDCG@{k}' for k in k_values]})
-            hybrid_scores = hybrid_per_query.get(qid, {k_label: 0.0 for k_label in [f'NDCG@{k}' for k in k_values]})
+            agentic_scores = agentic_per_query.get(qid, {f'NDCG@{k}': 0.0 for k in k_values})
+            hybrid_scores = hybrid_per_query.get(qid, {f'NDCG@{k}': 0.0 for k in k_values})
 
             agentic_primary = agentic_scores.get(primary_key, 0.0)
             hybrid_primary = hybrid_scores.get(primary_key, 0.0)
@@ -587,17 +663,14 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_run
                 winner = 'tie'
                 ties += 1
 
-            record = {
+            comparison_records.append({
                 '_id': qid,
                 'text': queries[qid],
                 'agentic_scores': agentic_scores,
                 'hybrid_scores': hybrid_scores,
-                f'agentic_{primary_key}': agentic_primary,
-                f'hybrid_{primary_key}': hybrid_primary,
                 'winner': winner,
                 'score_diff': round(agentic_primary - hybrid_primary, 5)
-            }
-            comparison_records.append(record)
+            })
 
         # ---------- Print aggregate summary ----------
         print('\n' + '=' * 80)
@@ -617,48 +690,27 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_run
         print(f'  Hybrid wins  : {hybrid_wins}/{len(comparison_records)}')
         print(f'  Ties         : {ties}/{len(comparison_records)}')
 
-        # ---------- Output files setup ----------
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_dir = os.path.join(pathlib.Path(__file__).parent.absolute(), "files")
-        os.makedirs(output_dir, exist_ok=True)
+        # ---------- Accumulate results ----------
+        all_evaluation_results.append({
+            'method': 'evaluate_both_hybrid',
+            'agentic_aggregate': {
+                'ndcg': agentic_ndcg,
+                'map': agentic_map,
+                'recall': agentic_recall,
+                'precision': agentic_precision
+            },
+            'hybrid_aggregate': {
+                'ndcg': hybrid_ndcg,
+                'map': hybrid_map,
+                'recall': hybrid_recall,
+                'precision': hybrid_precision
+            }
+        })
 
-        # ---------- Output File 1: queries ranked by agentic NDCG (descending) ----------
-        ranked_by_agentic = sorted(
-            comparison_records,
-            key=lambda x: x[f'agentic_{primary_key}'],
-            reverse=True
-        )
+        # Free per-query dicts
+        del agentic_per_query, hybrid_per_query, comparison_records
+        gc.collect()
 
-        ranked_file = os.path.join(output_dir, f'agentic_vs_hybrid_ranked_queries_{timestamp}.jsonl')
-        ranked_output = []
-        for rank, record in enumerate(ranked_by_agentic, 1):
-            ranked_output.append({
-                'rank': rank,
-                '_id': record['_id'],
-                'text': record['text'],
-                f'agentic_{primary_key}': record[f'agentic_{primary_key}'],
-                f'hybrid_{primary_key}': record[f'hybrid_{primary_key}'],
-                'winner': record['winner'],
-            })
-        write_jsonl(ranked_file, ranked_output)
-
-        # ---------- Output File 2: full comparison with all scores ----------
-        comparison_file = os.path.join(output_dir, f'agentic_vs_hybrid_scores_comparison_{timestamp}.jsonl')
-        full_output = []
-        for record in comparison_records:
-            full_output.append({
-                '_id': record['_id'],
-                'text': record['text'],
-                'agentic_scores': record['agentic_scores'],
-                'hybrid_scores': record['hybrid_scores'],
-                'winner': record['winner'],
-                'score_diff_agentic_minus_hybrid': record['score_diff'],
-            })
-        write_jsonl(comparison_file, full_output)
-
-        print(f'\nOutput files written:')
-        print(f'  Ranked by agentic : {ranked_file}')
-        print(f'  Full comparison   : {comparison_file}')
         print('--- end of results for evaluate_both_hybrid ---')
 
     # ──────────────────────────────────────────────
@@ -686,6 +738,23 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_run
         result_size = max(bm25_k_values)
         results = os_retrival.search_agentic(corpus, agentic_queries, top_k=result_size)
         ndcg, _map, recall, precision = retriever.evaluate(qrels, results, k_values)
+
+        # ---------- Accumulate results ----------
+        all_evaluation_results.append({
+            'method': 'agentic',
+            'aggregate': {
+                'ndcg': ndcg,
+                'map': _map,
+                'recall': recall,
+                'precision': precision
+            }
+        })
+
+        # FREE result dict
+        del results
+        gc.collect()
+        print('[memory] freed agentic results')
+
         print('--- end of results for ' + method)
 
     # ──────────────────────────────────────────────
@@ -710,6 +779,23 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_run
         result_size = max(bm25_k_values)
         results = os_retrival.search_bm25(corpus, queries, top_k=result_size)
         ndcg, _map, recall, precision = retriever.evaluate(qrels, results, k_values)
+
+        # ---------- Accumulate results ----------
+        all_evaluation_results.append({
+            'method': 'bm25',
+            'aggregate': {
+                'ndcg': ndcg,
+                'map': _map,
+                'recall': recall,
+                'precision': precision
+            }
+        })
+
+        # FREE result dict
+        del results
+        gc.collect()
+        print('[memory] freed bm25 results')
+
         print('--- end of results for ' + method)
 
     # ──────────────────────────────────────────────
@@ -728,14 +814,44 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_run
             top_k = max(model_k_values)
             result_size = max(bm25_k_values)
             all_experiments_took_time = []
+            last_ndcg = None
+            last_map = None
+            last_recall = None
+            last_precision = None
             for run in range(0, num_of_runs):
                 results = os_retrival.search_vector(corpus, queries, top_k=top_k, result_size=result_size)
                 # ── Collect took_time from each run ──────────────
                 all_experiments_took_time.append(os_retrival.took_time.copy())
                 # ─────────────────────────────────────────────────
-                ndcg, _map, recall, precision = retriever.evaluate(qrels, results, k_values)
+                last_ndcg, last_map, last_recall, last_precision = retriever.evaluate(qrels, results, k_values)
+
+                # FREE result dict after each run
+                del results
+                gc.collect()
+
             retriever.evaluate_time(all_experiments_took_time)
+
+            # ---------- Accumulate results (from last run) ----------
+            all_evaluation_results.append({
+                'method': method,
+                'pipeline': pipeline,
+                'num_runs': num_of_runs,
+                'aggregate': {
+                    'ndcg': last_ndcg,
+                    'map': last_map,
+                    'recall': last_recall,
+                    'precision': last_precision
+                }
+            })
+
+            print('[memory] freed vector search results')
             print('--- end of results for ' + method + " and pipeline " + pipeline)
+
+    # ──────────────────────────────────────────────
+    # Write all accumulated results to a single file
+    # ──────────────────────────────────────────────
+    if all_evaluation_results:
+        write_results_file(index, all_evaluation_results)
 
 
 def get_vector_methods(mm):

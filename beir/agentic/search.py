@@ -30,7 +30,7 @@ class RetrievalOpenSearchAgentic:
         self.results = {}
         self.index_name = index_name
         self.search_pipeline = search_pipeline
-        self.query_fields = query_fields if query_fields else ['text_key', 'title_key']
+        self.query_fields = query_fields if query_fields else ['passage_text']
         self.max_tokens = 512
 
         # Create results directory
@@ -223,7 +223,7 @@ class RetrievalOpenSearchAgentic:
         print(f"[DEBUG] Completed queries. Failed: {failed_queries}/{len(query_ids)}")
 
         # ---- Write a combined summary file with ALL queries ----
-        self._save_all_queries_summary(query_ids, queries_list, query_responses)
+        # self._save_all_queries_summary(query_ids, queries_list, query_responses)
 
         # Parse responses and build results
         for i in range(len(query_responses)):

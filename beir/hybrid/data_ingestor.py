@@ -1,12 +1,12 @@
 import itertools
-import textwrap
-from typing import Type, List, Dict, Union, Tuple
+from typing import Dict, Tuple
 from opensearchpy import OpenSearch, RequestsHttpConnection
 
 
 class OpenSearchDataIngestor:
 
-    def __init__(self, endpoint: str, port: str, http_auth: Tuple[str, str] = None, timeout: int = 30, language: str = "english"):
+    def __init__(self, endpoint: str, port: str, http_auth: Tuple[str, str] = None, 
+                 timeout: int = 300, language: str = "english"):
         """
         Initialize OpenSearch data ingestor.
         
@@ -31,54 +31,57 @@ class OpenSearchDataIngestor:
             'use_ssl': True,
             'verify_certs': True,
             'connection_class': RequestsHttpConnection,
-            'timeout': timeout
+            'timeout': timeout,
+            'max_retries': 3,
+            'retry_on_timeout': True,
         }
         
-        # Add authentication if provided
         if http_auth is not None:
             client_config['http_auth'] = http_auth
         
         self.opensearch = OpenSearch(**client_config)
-        self.bulk_size = 200
-        self.max_tokens = 512
+        self.bulk_size = 50
         self.language = language
 
     def ingest(self, corpus: Dict[str, Dict[str, str]], index: str):
-        '''for i in range(0, 200, self.bulk_size):'''
-        for i in range(0, len(corpus), self.bulk_size):
-            key_list = itertools.islice(corpus.keys(), i, i + self.bulk_size)
+        total = len(corpus)
+        corpus_keys = list(corpus.keys())
 
-            def get_doc_text(full_string: str):
-                str_as_list = textwrap.wrap(full_string, self.max_tokens, break_long_words=False,
-                                            break_on_hyphens=False)
-                return full_string if len(str_as_list) == 0 else str_as_list[0]
-                # return ' '.join(full_string.split()[:500])
-
-            def cleanup(s):
-                '''cleaned = s.replace('"', '')
-                cleaned = cleaned.replace("\'", "")
-                return cleaned
-                '''
-                return s
-
-            def get_content(corpus_doc):
-                if 'title' in corpus_doc.keys():
-                    return {
-                        'passage_text': cleanup(get_doc_text((corpus_doc["title"] + ' ' + corpus_doc["text"]).strip())), 'text_key': cleanup(corpus_doc['text']), 'title_key': cleanup(corpus_doc['title'])}
-                else:
-                    return {'passage_text': cleanup(get_doc_text((corpus_doc["text"]).strip())), 'text_key': cleanup(corpus_doc['text'])}
+        for i in range(0, total, self.bulk_size):
+            batch_keys = corpus_keys[i:i + self.bulk_size]
 
             actions = []
-            _ = [
-                actions.extend(
-                    [{'index': {'_index': index, '_id': key_id}},
-                     get_content(corpus[key_id])])
-                for key_id in key_list
-            ]
-            # actions[1::2] = [{'passage_text': corpus[key_id]['text']} for key_id in key_list]
-            self.opensearch.bulk(
-                index=index,
-                body=actions)
+            for key_id in batch_keys:
+                doc = corpus[key_id]
+                title = doc.get("title", "")
+                text = doc.get("text", "")
 
-            if i % 1000 == 0:
-                print("Ingested " + str(i) + " documents")
+                # Combine title + text into single passage, no truncation
+                passage = (title + " " + text).strip() if title else text.strip()
+
+                actions.append({"index": {"_index": index, "_id": key_id}})
+                actions.append({"passage_text": passage})
+
+            try:
+                response = self.opensearch.bulk(
+                    index=index,
+                    body=actions
+                )
+                if response.get("errors", False):
+                    error_count = sum(
+                        1 for item in response["items"]
+                        if "error" in item.get("index", {})
+                    )
+                    print(f"Ingested {min(i + self.bulk_size, total)}/{total} ({error_count} errors)")
+                    # Log first error for debugging
+                    for item in response["items"]:
+                        err = item.get("index", {}).get("error")
+                        if err:
+                            print(f"  Error sample: {err}")
+                            break
+                else:
+                    print(f"Ingested {min(i + self.bulk_size, total)}/{total}")
+
+            except Exception as e:
+                print(f"ERROR at batch {i}-{i + self.bulk_size}: {e}")
+                raise
